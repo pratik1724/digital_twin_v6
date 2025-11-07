@@ -1,0 +1,31 @@
+version: 0.0
+os: linux
+files:
+  - source: /build_revision/backend
+    destination: /opt/digital_twin/backend
+  - source: /build_revision/frontend
+    destination: /opt/digital_twin/frontend
+  - source: /build_revision/deploy-scripts
+    destination: /opt/digital_twin/deploy-scripts
+
+hooks:
+  BeforeInstall:
+    - location: /opt/digital_twin/deploy-scripts/before_install.sh
+      timeout: 300
+      runas: root
+  AfterInstall:
+    - location: /opt/digital_twin/deploy-scripts/after_install.sh
+      timeout: 300
+      runas: root
+  ApplicationStop:
+    - location: /opt/digital_twin/deploy-scripts/stop_app.sh
+      timeout: 300
+      runas: root
+  ApplicationStart:
+    - location: /opt/digital_twin/deploy-scripts/start_app.sh
+      timeout: 300
+      runas: root
+  ValidateService:
+    - location: /opt/digital_twin/deploy-scripts/validate_service.sh
+      timeout: 60
+      runas: root
