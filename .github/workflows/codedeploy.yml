@@ -1,0 +1,165 @@
+name: CI → CodeDeploy (Test → Prod with Approval)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1         # <-- change
+  S3_BUCKET: my-digital-twin-deploy-bucket  # <-- change
+  APP_NAME: digital-twin-app    # <-- change
+  TEST_DGROUP: digital-twin-test-dg
+  PROD_DGROUP: digital-twin-prod-dg
+  REVISION_KEY_PREFIX: codedeploy/revisions
+
+jobs:
+  build:
+    name: Build & package
+    runs-on: ubuntu-latest
+    outputs:
+      s3_key: ${{ steps.set_s3_key.outputs.s3_key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Example: Build backend (adjust if your backend build differs)
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install backend deps (if needed)
+        run: |
+          if [ -f "backend/requirements.txt" ]; then
+            pip install -r backend/requirements.txt
+          fi
+
+      - name: Build frontend (if present)
+        run: |
+          if [ -d "frontend" ]; then
+            cd frontend
+            if [ -f package.json ]; then
+              npm ci
+              npm run build || true
+            fi
+            cd ..
+          fi
+
+      - name: Prepare revision (zip)
+        id: zip
+        run: |
+          set -e
+          REVNAME="revision-${GITHUB_SHA}.zip"
+          mkdir -p build_revision
+          # Copy backend and frontend into build_revision (adjust as needed)
+          if [ -d "backend" ]; then
+            cp -r backend build_revision/backend
+          fi
+          if [ -d "frontend" ]; then
+            cp -r frontend build_revision/frontend
+          fi
+          # include appspec and deploy scripts
+          cp appspec.yml build_revision/ || true
+          cp -r deploy-scripts build_revision/ || true
+          cd build_revision
+          zip -r "../${REVNAME}" ./*
+          cd ..
+          echo "revname=${REVNAME}" >> $GITHUB_OUTPUT
+
+      - name: Set S3 key name
+        id: set_s3_key
+        run: |
+          KEY="${REVISION_KEY_PREFIX}/$(date +%Y%m%d_%H%M%S)_${GITHUB_SHA}.zip"
+          echo "s3_key=${KEY}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_DEPLOY_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_DEPLOY_SECRET }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload revision to S3
+        run: |
+          aws s3 cp "${{ steps.zip.outputs.revname }}" "s3://${{ env.S3_BUCKET }}/${{ steps.set_s3_key.outputs.s3_key }}"
+
+  deploy-test:
+    name: Deploy → TEST (CodeDeploy)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: test
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_DEPLOY_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_DEPLOY_SECRET }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create CodeDeploy deployment (TEST)
+        id: create_deploy_test
+        run: |
+          S3_KEY="${{ needs.build.outputs.s3_key }}"
+          echo "Using S3 Key: $S3_KEY"
+          DEPLOY_ID=$(aws deploy create-deployment \
+            --application-name "${{ env.APP_NAME }}" \
+            --deployment-group-name "${{ env.TEST_DGROUP }}" \
+            --revision "revisionType=S3,s3Location={bucket=${{ env.S3_BUCKET }},key=${S3_KEY},bundleType=zip}" \
+            --description "Deploy to TEST from GH ${GITHUB_SHA}" \
+            --query "deploymentId" --output text)
+          echo "deployment_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for CodeDeploy finish (TEST)
+        run: |
+          DEPLOY_ID="${{ steps.create_deploy_test.outputs.deployment_id }}"
+          echo "Waiting for deployment $DEPLOY_ID to complete..."
+          aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"
+          echo "Test deployment completed."
+
+  approve-production:
+    name: Manual approval for PRODUCTION
+    needs: deploy-test
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://your-production-url.example.com
+    steps:
+      - name: Await approval
+        run: |
+          echo "This job waits for a production environment approval in GitHub (go to Actions → required approvers)."
+
+  deploy-prod:
+    name: Deploy → PROD (CodeDeploy)
+    needs: approve-production
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_DEPLOY_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_DEPLOY_SECRET }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create CodeDeploy deployment (PROD)
+        id: create_deploy_prod
+        run: |
+          S3_KEY="${{ needs.build.outputs.s3_key }}"
+          DEPLOY_ID=$(aws deploy create-deployment \
+            --application-name "${{ env.APP_NAME }}" \
+            --deployment-group-name "${{ env.PROD_DGROUP }}" \
+            --revision "revisionType=S3,s3Location={bucket=${{ env.S3_BUCKET }},key=${S3_KEY},bundleType=zip}" \
+            --description "Deploy to PROD from GH ${GITHUB_SHA}" \
+            --query "deploymentId" --output text)
+          echo "deployment_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for CodeDeploy finish (PROD)
+        run: |
+          DEPLOY_ID="${{ steps.create_deploy_prod.outputs.deployment_id }}"
+          echo "Waiting for deployment $DEPLOY_ID to complete..."
+          aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"
+          echo "Production deployment completed."
